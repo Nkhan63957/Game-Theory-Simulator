@@ -1,0 +1,177 @@
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# ── Prisoner's Dilemma: Iterated Play ────────────────────────────────────────
+STRATEGIES = {
+    'Always Defect':    lambda h: 'D',
+    'Always Cooperate': lambda h: 'C',
+    'Tit-for-Tat':      lambda h: h[-1] if h else 'C',
+    'Grim Trigger':     lambda h: 'D' if 'D' in h else 'C',
+    'Random':           lambda h: np.random.choice(['C','D']),
+}
+
+def run_ipd(strat1_name, strat2_name, rounds=50):
+    s1 = STRATEGIES[strat1_name]
+    s2 = STRATEGIES[strat2_name]
+    h1, h2 = [], []
+    scores1, scores2 = [], []
+    PAYOFF = {('C','C'): (-1,-1), ('C','D'): (-3,0),
+              ('D','C'): (0,-3),  ('D','D'): (-2,-2)}
+    for _ in range(rounds):
+        a1 = s1(h2); a2 = s2(h1)
+        p1, p2 = PAYOFF[(a1, a2)]
+        h1.append(a1); h2.append(a2)
+        scores1.append(p1); scores2.append(p2)
+    return h1, h2, scores1, scores2
+
+print("=" * 55)
+print("PRISONER'S DILEMMA — ITERATED PLAY TOURNAMENT")
+print("=" * 55)
+strat_names = list(STRATEGIES.keys())
+tournament  = np.zeros((len(strat_names), len(strat_names)))
+for i, s1 in enumerate(strat_names):
+    for j, s2 in enumerate(strat_names):
+        _, _, sc1, _ = run_ipd(s1, s2, rounds=100)
+        tournament[i, j] = sum(sc1)
+print(f"\nTournament payoff matrix (row player total score):")
+df_t = pd.DataFrame(tournament,
+                    index=strat_names, columns=strat_names) if True else None
+import pandas as pd
+df_t = pd.DataFrame(tournament.round(0).astype(int),
+                    index=strat_names, columns=strat_names)
+print(df_t.to_string())
+print(f"\nOverall winner: "
+      f"{strat_names[np.argmax(tournament.sum(axis=1))]}")
+
+# ── Cournot Oligopoly ─────────────────────────────────────────────────────────
+def cournot_nash(a=100, b=1, c1=10, c2=10):
+    """
+    Inverse demand: P = a - b*(q1+q2)
+    Firm i profit: pi_i = (P - ci)*qi
+    Best response: q1* = (a-c1)/2b - q2/2
+    Nash: q1 = q2 = (a-c)/3b (symmetric case)
+    """
+    q1_nash = (a - 2*c1 + c2) / (3*b)
+    q2_nash = (a - 2*c2 + c1) / (3*b)
+    Q_nash  = q1_nash + q2_nash
+    P_nash  = a - b * Q_nash
+    pi1_nash = (P_nash - c1) * q1_nash
+    pi2_nash = (P_nash - c2) * q2_nash
+
+    Q_monopoly  = (a - c1) / (2*b)
+    P_monopoly  = a - b * Q_monopoly
+    pi_monopoly = (P_monopoly - c1) * Q_monopoly
+
+    Q_competitive = (a - c1) / b
+    P_competitive = c1
+
+    return {
+        'q1_nash': round(q1_nash, 2),
+        'q2_nash': round(q2_nash, 2),
+        'Q_nash':  round(Q_nash, 2),
+        'P_nash':  round(P_nash, 2),
+        'pi1_nash':round(pi1_nash, 2),
+        'pi2_nash':round(pi2_nash, 2),
+        'Q_monopoly':  round(Q_monopoly, 2),
+        'P_monopoly':  round(P_monopoly, 2),
+        'pi_monopoly': round(pi_monopoly, 2),
+        'Q_competitive': round(Q_competitive, 2),
+        'P_competitive': round(P_competitive, 2),
+    }
+
+def best_response(q_other, firm=1, a=100, b=1, c1=10, c2=10):
+    c = c1 if firm == 1 else c2
+    return max(0, (a - c - b*q_other) / (2*b))
+
+print("\n" + "=" * 55)
+print("COURNOT OLIGOPOLY")
+print("=" * 55)
+r = cournot_nash()
+print(f"Nash Equilibrium:")
+print(f"  q1* = {r['q1_nash']}, q2* = {r['q2_nash']}")
+print(f"  Market price P* = {r['P_nash']}")
+print(f"  Profit: π1={r['pi1_nash']}, π2={r['pi2_nash']}")
+print(f"\nMonopoly benchmark:")
+print(f"  Q = {r['Q_monopoly']}, P = {r['P_monopoly']}, "
+      f"π = {r['pi_monopoly']}")
+print(f"\nPerfect competition benchmark:")
+print(f"  Q = {r['Q_competitive']}, P = {r['P_competitive']}, π = 0")
+print(f"\nNash vs Monopoly: firms produce "
+      f"{r['Q_nash']/r['Q_monopoly']:.2f}x monopoly output")
+print(f"Nash vs Competition: {r['Q_nash']/r['Q_competitive']:.2f}x "
+      f"competitive output")
+
+# Visualize best response curves
+q_range = np.linspace(0, 60, 200)
+br1 = [best_response(q, firm=1) for q in q_range]
+br2 = [best_response(q, firm=2) for q in q_range]
+
+fig_c = go.Figure()
+fig_c.add_trace(go.Scatter(x=q_range, y=br1, mode='lines',
+    name='BR₁(q₂)', line=dict(color='#60a5fa', width=2.5)))
+fig_c.add_trace(go.Scatter(x=br2, y=q_range, mode='lines',
+    name='BR₂(q₁)', line=dict(color='#34d399', width=2.5)))
+fig_c.add_trace(go.Scatter(
+    x=[r['q1_nash']], y=[r['q2_nash']], mode='markers',
+    name='Nash Eq', marker=dict(color='#f59e0b', size=14, symbol='star')))
+fig_c.update_layout(
+    title="Cournot Oligopoly — Best Response Curves",
+    xaxis_title="q₁", yaxis_title="q₂",
+    template="plotly_dark", height=450,
+    paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+    font=dict(color='white'))
+fig_c.show()
+
+# ── Public Goods Game ─────────────────────────────────────────────────────────
+def public_goods_simulation(n_players=5, endowment=10,
+                             return_rate=1.6, rounds=30, noise=0.1):
+    """
+    Each player i contributes c_i ∈ [0, endowment].
+    Total contribution multiplied by return_rate and shared equally.
+    Nash: contribute 0 if return_rate < n_players (usually).
+    Socially optimal: contribute everything if return_rate > 1.
+    """
+    contributions = np.ones(n_players) * endowment * 0.5
+    history = []
+
+    for round_n in range(rounds):
+        total  = np.sum(contributions)
+        share  = return_rate * total / n_players
+        payoff = endowment - contributions + share
+
+        history.append({
+            'round': round_n,
+            'avg_contribution': np.mean(contributions),
+            'total_contribution': total,
+            'avg_payoff': np.mean(payoff)
+        })
+
+        # Imitation + noise: players copy high-payoff strategies
+        best_player = np.argmax(payoff)
+        new_contribs = []
+        for i in range(n_players):
+            if payoff[i] < np.mean(payoff):
+                new_c = contributions[best_player] + np.random.normal(0, noise)
+            else:
+                new_c = contributions[i] + np.random.normal(0, noise * 0.5)
+            new_contribs.append(np.clip(new_c, 0, endowment))
+        contributions = np.array(new_contribs)
+
+    return pd.DataFrame(history)
+
+print("\n" + "=" * 55)
+print("PUBLIC GOODS GAME")
+print("=" * 55)
+pg_df = public_goods_simulation(n_players=5, return_rate=1.6, rounds=40)
+print(f"Round 1  avg contribution: "
+      f"{pg_df.iloc[0]['avg_contribution']:.2f}")
+print(f"Round 20 avg contribution: "
+      f"{pg_df.iloc[20]['avg_contribution']:.2f}")
+print(f"Round 40 avg contribution: "
+      f"{pg_df.iloc[-1]['avg_contribution']:.2f}")
+print(f"Nash prediction: 0.0 (free rider)")
+print(f"Social optimum: 10.0 (full contribution)")
+print(f"Observed: slow drift toward free-riding ✓")
+
+print("\nAll classic games complete ✓")

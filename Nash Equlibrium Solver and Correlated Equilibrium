@@ -1,0 +1,198 @@
+import numpy as np
+from scipy.optimize import linprog, minimize
+import itertools
+import warnings
+warnings.filterwarnings('ignore')
+
+# ── Dominance Elimination ─────────────────────────────────────────────────────
+def dominance_elimination(A, B, max_rounds=20):
+    rows = list(range(A.shape[0]))
+    cols = list(range(A.shape[1]))
+    changed = True
+    rounds  = 0
+    log     = []
+    while changed and rounds < max_rounds:
+        changed = False
+        rounds += 1
+        to_remove = []
+        for r in rows:
+            for r2 in rows:
+                if r == r2: continue
+                if all(A[r2, c] > A[r, c] for c in cols):
+                    to_remove.append(r)
+                    log.append(f"Row {r} strictly dominated by Row {r2}")
+                    break
+        for r in set(to_remove):
+            if r in rows:
+                rows.remove(r); changed = True
+        to_remove = []
+        for c in cols:
+            for c2 in cols:
+                if c == c2: continue
+                if all(B[r, c2] > B[r, c] for r in rows):
+                    to_remove.append(c)
+                    log.append(f"Col {c} strictly dominated by Col {c2}")
+                    break
+        for c in set(to_remove):
+            if c in cols:
+                cols.remove(c); changed = True
+    return rows, cols, log
+
+# ── Pure Nash ─────────────────────────────────────────────────────────────────
+def find_pure_nash(A, B):
+    n_rows, n_cols = A.shape
+    equilibria = []
+    for r in range(n_rows):
+        for c in range(n_cols):
+            if A[r,c] == np.max(A[:,c]) and B[r,c] == np.max(B[r,:]):
+                equilibria.append((r, c, A[r,c], B[r,c]))
+    return equilibria
+
+# ── Mixed Nash 2×2 ────────────────────────────────────────────────────────────
+def find_mixed_nash_2x2(A, B):
+    results = {}
+    denom_p = B[0,0] - B[1,0] - B[0,1] + B[1,1]
+    denom_q = A[0,0] - A[0,1] - A[1,0] + A[1,1]
+    if abs(denom_p) > 1e-10:
+        p = (B[1,1] - B[1,0]) / denom_p
+        if 0 <= p <= 1:
+            results['p']          = round(p, 4)
+            results['row_payoff'] = round(p*A[0,0]+(1-p)*A[1,0], 4)
+    if abs(denom_q) > 1e-10:
+        q = (A[1,1] - A[0,1]) / denom_q
+        if 0 <= q <= 1:
+            results['q']          = round(q, 4)
+            results['col_payoff'] = round(q*B[0,0]+(1-q)*B[0,1], 4)
+    return results
+
+# ── Correlated Equilibrium via LP ─────────────────────────────────────────────
+def find_correlated_equilibrium(A, B):
+    """
+    Maximize social welfare sum(p_ij * (A_ij + B_ij))
+    subject to incentive compatibility constraints.
+    For each player i and each pair of strategies (a, a'):
+    sum_s p(a,s) * [u_i(a,s) - u_i(a',s)] >= 0
+    plus p >= 0 and sum(p) = 1.
+    """
+    n, m = A.shape
+    n_vars = n * m
+
+    # Objective: maximize social welfare → minimize negative
+    c_obj = -(A + B).flatten()
+
+    # Constraints
+    A_ub = []
+    b_ub = []
+
+    # Row player IC: for each r, r2 pair
+    for r in range(n):
+        for r2 in range(n):
+            if r == r2: continue
+            row = np.zeros(n_vars)
+            for col in range(m):
+                row[r*m + col] = -(A[r, col] - A[r2, col])
+            A_ub.append(row)
+            b_ub.append(0)
+
+    # Col player IC: for each c, c2 pair
+    for c in range(m):
+        for c2 in range(m):
+            if c == c2: continue
+            row = np.zeros(n_vars)
+            for r in range(n):
+                row[r*m + c] = -(B[r, c] - B[r, c2])
+            A_ub.append(row)
+            b_ub.append(0)
+
+    # Equality: probabilities sum to 1
+    A_eq = np.ones((1, n_vars))
+    b_eq = [1.0]
+
+    bounds = [(0, None)] * n_vars
+
+    result = linprog(
+        c_obj,
+        A_ub=np.array(A_ub), b_ub=np.array(b_ub),
+        A_eq=A_eq, b_eq=b_eq,
+        bounds=bounds, method='highs'
+    )
+
+    if result.success:
+        p = result.x.reshape(n, m)
+        sw = np.sum(p * (A + B))
+        return p, sw
+    return None, None
+
+# ── Full Solver ───────────────────────────────────────────────────────────────
+def solve_game(A, B, labels_row=None, labels_col=None):
+    n, m = A.shape
+    if labels_row is None: labels_row = [f"R{i}" for i in range(n)]
+    if labels_col is None: labels_col = [f"C{j}" for j in range(m)]
+
+    print("=" * 60)
+    print("GAME THEORY SOLVER")
+    print("=" * 60)
+    print(f"Game: {n}×{m}")
+    print(f"\nRow payoff matrix A:\n{A}")
+    print(f"\nCol payoff matrix B:\n{B}")
+
+    # Step 1: Dominance
+    rows, cols, log = dominance_elimination(A, B)
+    print(f"\nDominance Elimination:")
+    if log:
+        for l in log: print(f"  → {l}")
+    else:
+        print("  No dominated strategies found")
+    print(f"  Surviving: Rows {rows}, Cols {cols}")
+
+    # Step 2: Pure Nash
+    pure = find_pure_nash(A, B)
+    print(f"\nPure Strategy Nash Equilibria: {len(pure)} found")
+    for r, c, ar, bc in pure:
+        print(f"  ({labels_row[r]}, {labels_col[c]}) → "
+              f"Payoffs: Row={ar}, Col={bc}")
+
+    # Step 3: Mixed Nash (2×2 only)
+    if n == 2 and m == 2:
+        mixed = find_mixed_nash_2x2(A, B)
+        print(f"\nMixed Strategy Nash Equilibrium:")
+        if 'p' in mixed:
+            print(f"  Row player: p={mixed['p']} on {labels_row[0]}, "
+                  f"{1-mixed['p']} on {labels_row[1]}")
+        if 'q' in mixed:
+            print(f"  Col player: q={mixed['q']} on {labels_col[0]}, "
+                  f"{1-mixed['q']} on {labels_col[1]}")
+
+    # Step 4: Correlated Equilibrium
+    ce, sw = find_correlated_equilibrium(A, B)
+    if ce is not None:
+        print(f"\nCorrelated Equilibrium (max social welfare):")
+        print(f"  Distribution:\n{np.round(ce, 4)}")
+        print(f"  Social welfare: {sw:.4f}")
+        # Nash social welfare
+        nash_sw = max(A[r,c]+B[r,c] for r,c,_,_ in pure) if pure else 0
+        print(f"  Nash social welfare: {nash_sw:.4f}")
+        if sw > nash_sw + 0.001:
+            print(f"  → Correlated equilibrium improves welfare by "
+                  f"{sw-nash_sw:.4f} ✓")
+
+    print("=" * 60)
+    return {'pure': pure, 'mixed': mixed if n==2 and m==2 else {},
+            'correlated': ce, 'social_welfare': sw}
+
+
+# ── Test on classic games ─────────────────────────────────────────────────────
+print("TEST 1: Prisoner's Dilemma")
+A_pd = np.array([[-1, -3], [0, -2]], dtype=float)
+B_pd = np.array([[-1, 0],  [-3,-2]], dtype=float)
+r1 = solve_game(A_pd, B_pd, ['Cooperate','Defect'], ['Cooperate','Defect'])
+
+print("\nTEST 2: Chicken Game")
+A_ch = np.array([[0, -1], [1, -10]], dtype=float)
+B_ch = np.array([[0, 1], [-1,-10]], dtype=float)
+r2 = solve_game(A_ch, B_ch, ['Swerve','Straight'], ['Swerve','Straight'])
+
+print("\nTEST 3: Battle of the Sexes")
+A_bs = np.array([[3, 0], [0, 1]], dtype=float)
+B_bs = np.array([[1, 0], [0, 3]], dtype=float)
+r3 = solve_game(A_bs, B_bs, ['Opera','Football'], ['Opera','Football'])

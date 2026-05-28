@@ -1,0 +1,230 @@
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# ── Cournot Environment ───────────────────────────────────────────────────────
+class CournotEnv:
+    """
+    Two-firm Cournot environment.
+    State: [q1_last, q2_last]
+    Action: quantity to produce (continuous [0, Q_MAX])
+    Reward: profit = (P - c) * q_i where P = a - b*(q1+q2)
+    Nash: q* = (a-c)/(3b) ≈ 30 for default params
+    """
+    def __init__(self, a=100, b=1, c=10, q_max=60):
+        self.a = a; self.b = b; self.c = c; self.q_max = q_max
+        self.q_nash = (a - c) / (3 * b)
+        self.pi_nash = (a - 2*c + c) / 3 * self.q_nash  # simplification
+
+    def profit(self, q1, q2):
+        P = max(0, self.a - self.b*(q1+q2))
+        pi1 = (P - self.c) * q1
+        pi2 = (P - self.c) * q2
+        return pi1, pi2
+
+    def best_response(self, q_other):
+        return max(0, (self.a - self.c - self.b*q_other) / (2*self.b))
+
+
+# ── Gradient Ascent Multi-Agent RL ───────────────────────────────────────────
+class GradientAgent:
+    """
+    Policy gradient agent with Gaussian policy.
+    Policy: q ~ N(μ, σ²) where μ is learned.
+    Update: μ ← μ + α * ∇_μ E[profit]
+    """
+    def __init__(self, q_init=20.0, lr=0.05, sigma=3.0, name="Agent"):
+        self.mu    = q_init
+        self.lr    = lr
+        self.sigma = sigma
+        self.name  = name
+        self.history_mu = [q_init]
+        self.history_q  = []
+        self.history_pi = []
+
+    def act(self):
+        q = np.clip(np.random.normal(self.mu, self.sigma), 0, 60)
+        self.history_q.append(q)
+        return q
+
+    def update(self, q_self, profit):
+        # REINFORCE gradient: ∇_μ log π(q|μ) * profit
+        # = (q - μ)/σ² * profit
+        grad      = (q_self - self.mu) / (self.sigma**2) * profit
+        self.mu   = np.clip(self.mu + self.lr * grad, 0, 60)
+        self.sigma = max(0.5, self.sigma * 0.9995)  # decay exploration
+        self.history_mu.append(self.mu)
+        self.history_pi.append(profit)
+
+
+# ── Fictitious Play ───────────────────────────────────────────────────────────
+def fictitious_play(env, rounds=500):
+    """
+    Fictitious play: each agent best-responds to the
+    empirical average of opponent's past actions.
+    Classic convergence result for zero-sum games;
+    also works for many non-zero-sum games.
+    """
+    q1_hist = [np.random.uniform(10, 50)]
+    q2_hist = [np.random.uniform(10, 50)]
+
+    for t in range(1, rounds):
+        q1_avg = np.mean(q1_hist)
+        q2_avg = np.mean(q2_hist)
+        q1_new = env.best_response(q2_avg) + np.random.normal(0, 1)
+        q2_new = env.best_response(q1_avg) + np.random.normal(0, 1)
+        q1_hist.append(np.clip(q1_new, 0, 60))
+        q2_hist.append(np.clip(q2_new, 0, 60))
+
+    return np.array(q1_hist), np.array(q2_hist)
+
+
+# ── Run experiments ───────────────────────────────────────────────────────────
+np.random.seed(42)
+env = CournotEnv()
+
+print("=" * 60)
+print("MULTI-AGENT RL — COURNOT COMPETITION")
+print("=" * 60)
+print(f"Nash Equilibrium: q₁* = q₂* = {env.q_nash:.2f}")
+print(f"Monopoly quantity: {(env.a-env.c)/(2*env.b):.2f}")
+print(f"Competitive quantity: {(env.a-env.c)/env.b:.2f}")
+
+# Experiment 1: Gradient ascent agents
+print("\nExperiment 1: Gradient Ascent Agents")
+agent1 = GradientAgent(q_init=15.0, lr=0.08, name="Firm 1")
+agent2 = GradientAgent(q_init=45.0, lr=0.08, name="Firm 2")
+
+n_rounds = 1000
+for t in range(n_rounds):
+    q1 = agent1.act()
+    q2 = agent2.act()
+    pi1, pi2 = env.profit(q1, q2)
+    agent1.update(q1, pi1)
+    agent2.update(q2, pi2)
+
+print(f"  Final Firm 1 quantity: {agent1.mu:.2f} "
+      f"(Nash target: {env.q_nash:.2f})")
+print(f"  Final Firm 2 quantity: {agent2.mu:.2f} "
+      f"(Nash target: {env.q_nash:.2f})")
+print(f"  Convergence to Nash: "
+      f"{'Yes ✓' if abs(agent1.mu-env.q_nash)<5 else 'Partial'}")
+
+# Experiment 2: Fictitious play
+print("\nExperiment 2: Fictitious Play")
+q1_fp, q2_fp = fictitious_play(env, rounds=500)
+print(f"  Final Firm 1: {q1_fp[-1]:.2f}, "
+      f"Final Firm 2: {q2_fp[-1]:.2f}")
+print(f"  Nash: {env.q_nash:.2f}")
+print(f"  Converged: "
+      f"{'Yes ✓' if abs(q1_fp[-1]-env.q_nash)<3 else 'Partial'}")
+
+# Experiment 3: Collusion detection
+# Do agents learn to collude (produce less = monopoly)?
+print("\nExperiment 3: Can Agents Learn to Collude?")
+# Low learning rate + memory of past profits
+agent_c1 = GradientAgent(q_init=20.0, lr=0.02, sigma=5.0, name="Colluder 1")
+agent_c2 = GradientAgent(q_init=20.0, lr=0.02, sigma=5.0, name="Colluder 2")
+
+for t in range(2000):
+    q1 = agent_c1.act()
+    q2 = agent_c2.act()
+    pi1, pi2 = env.profit(q1, q2)
+    agent_c1.update(q1, pi1)
+    agent_c2.update(q2, pi2)
+
+monopoly_q = (env.a - env.c) / (2*env.b)
+print(f"  Final quantities: {agent_c1.mu:.2f}, {agent_c2.mu:.2f}")
+print(f"  Monopoly optimum: {monopoly_q:.2f} each")
+print(f"  Nash equilibrium: {env.q_nash:.2f} each")
+print(f"  Outcome: {'Approaching collusion' if agent_c1.mu < env.q_nash else 'Nash behavior'}")
+
+# ── Visualization ─────────────────────────────────────────────────────────────
+fig_rl = make_subplots(
+    rows=2, cols=2,
+    subplot_titles=[
+        "Gradient Ascent: Quantity Convergence",
+        "Gradient Ascent: Profit Over Time",
+        "Fictitious Play: Convergence to Nash",
+        "Quantity Path in Strategy Space"
+    ]
+)
+
+# Plot 1: Quantity convergence
+t_ax = list(range(n_rounds+1))
+fig_rl.add_trace(go.Scatter(x=t_ax, y=agent1.history_mu,
+    name='Firm 1 (μ)', line=dict(color='#60a5fa',width=2)),row=1,col=1)
+fig_rl.add_trace(go.Scatter(x=t_ax, y=agent2.history_mu,
+    name='Firm 2 (μ)', line=dict(color='#34d399',width=2)),row=1,col=1)
+fig_rl.add_hline(y=env.q_nash,line_dash="dash",line_color="#f59e0b",
+                  line_width=2,row=1,col=1)
+fig_rl.add_annotation(x=n_rounds*0.8,y=env.q_nash+2,
+    text=f"Nash q*={env.q_nash:.1f}",
+    font=dict(color="#f59e0b",size=10),showarrow=False,row=1,col=1)
+
+# Plot 2: Rolling profit
+window = 50
+r1_roll = pd.Series(agent1.history_pi).rolling(window).mean()
+r2_roll = pd.Series(agent2.history_pi).rolling(window).mean()
+fig_rl.add_trace(go.Scatter(x=list(range(n_rounds)),y=r1_roll,
+    name='Firm 1 profit',line=dict(color='#60a5fa',width=2),
+    showlegend=False),row=1,col=2)
+fig_rl.add_trace(go.Scatter(x=list(range(n_rounds)),y=r2_roll,
+    name='Firm 2 profit',line=dict(color='#34d399',width=2),
+    showlegend=False),row=1,col=2)
+
+# Plot 3: Fictitious play
+t_fp = list(range(len(q1_fp)))
+fig_rl.add_trace(go.Scatter(x=t_fp,y=q1_fp,
+    name='FP Firm 1',line=dict(color='#a78bfa',width=1.5),
+    showlegend=False),row=2,col=1)
+fig_rl.add_trace(go.Scatter(x=t_fp,y=q2_fp,
+    name='FP Firm 2',line=dict(color='#fb923c',width=1.5),
+    showlegend=False),row=2,col=1)
+fig_rl.add_hline(y=env.q_nash,line_dash="dash",
+                  line_color="#f59e0b",line_width=2,row=2,col=1)
+
+# Plot 4: Strategy space path
+fig_rl.add_trace(go.Scatter(
+    x=agent1.history_mu[::10], y=agent2.history_mu[::10],
+    mode='lines+markers', name='Strategy path',
+    line=dict(color='#60a5fa',width=1.5),
+    marker=dict(size=4,color=list(range(len(agent1.history_mu[::10]))),
+                colorscale='Blues'),
+    showlegend=False
+),row=2,col=2)
+fig_rl.add_trace(go.Scatter(
+    x=[env.q_nash],y=[env.q_nash],mode='markers',name='Nash Eq',
+    marker=dict(color='#f59e0b',size=14,symbol='star')
+),row=2,col=2)
+
+# Best response curves in strategy space
+q_br = np.linspace(0,60,100)
+br1  = [env.best_response(q) for q in q_br]
+br2  = [env.best_response(q) for q in q_br]
+fig_rl.add_trace(go.Scatter(x=q_br,y=br1,mode='lines',
+    name='BR₁',line=dict(color='#f87171',width=1.5,dash='dot'),
+    showlegend=False),row=2,col=2)
+fig_rl.add_trace(go.Scatter(x=br2,y=q_br,mode='lines',
+    name='BR₂',line=dict(color='#34d399',width=1.5,dash='dot'),
+    showlegend=False),row=2,col=2)
+
+fig_rl.update_layout(
+    title="Multi-Agent RL: Two Firms Learning Cournot Competition",
+    template="plotly_dark",height=700,
+    paper_bgcolor="#0e1117",plot_bgcolor="#0e1117",
+    font=dict(color='white')
+)
+fig_rl.update_xaxes(gridcolor='#1f2937')
+fig_rl.update_yaxes(gridcolor='#1f2937')
+for r,c,xl,yl in [(1,1,"Round","Quantity μ"),
+                   (1,2,"Round","Avg Profit"),
+                   (2,1,"Round","Quantity"),
+                   (2,2,"Firm 1 Quantity","Firm 2 Quantity")]:
+    fig_rl.update_xaxes(title_text=xl,row=r,col=c)
+    fig_rl.update_yaxes(title_text=yl,row=r,col=c)
+fig_rl.show()
+
+print("\nMulti-agent RL complete ✓")
+
+import pandas as pd

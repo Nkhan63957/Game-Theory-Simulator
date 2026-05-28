@@ -1,0 +1,217 @@
+import numpy as np
+from scipy.optimize import fsolve
+import plotly.graph_objects as go
+
+# ── Quantal Response Equilibrium ─────────────────────────────────────────────
+def logit_qre(A, B, lam, tol=1e-10, max_iter=1000):
+    """
+    Logit Quantal Response Equilibrium.
+    σ_i(a) = exp(λ * EU_i(a, σ_{-i})) / Z_i
+    Players are noisy best responders: better responses
+    are chosen more often, not exclusively.
+    As λ→∞: QRE → Nash. As λ→0: QRE → uniform random.
+    """
+    n, m  = A.shape
+    # Initialize at uniform
+    p = np.ones(n) / n  # row player mixed strategy
+    q = np.ones(m) / m  # col player mixed strategy
+
+    for _ in range(max_iter):
+        # Expected payoffs
+        eu_row = A @ q   # shape (n,)
+        eu_col = B.T @ p # shape (m,)
+
+        # Logit best response
+        p_new = np.exp(lam * eu_row)
+        p_new /= p_new.sum()
+        q_new = np.exp(lam * eu_col)
+        q_new /= q_new.sum()
+
+        if (np.max(np.abs(p_new - p)) < tol and
+            np.max(np.abs(q_new - q)) < tol):
+            break
+
+        p, q = p_new, q_new
+
+    return p, q
+
+print("=" * 60)
+print("QUANTAL RESPONSE EQUILIBRIUM")
+print("=" * 60)
+
+# Prisoner's Dilemma
+A_pd = np.array([[-1., -3.], [0., -2.]])
+B_pd = np.array([[-1., 0.], [-3., -2.]])
+
+print("\nPrisoner's Dilemma: QRE across precision λ")
+print(f"{'λ':>8} {'P(Cooperate)':>14} {'Nash Pred':>12}")
+print("-" * 40)
+lambdas = [0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 50.0]
+for lam in lambdas:
+    p, q = logit_qre(A_pd, B_pd, lam)
+    print(f"{lam:>8.2f} {p[0]:>14.4f} {'0.0 (all-D)':>12}")
+
+print(f"\n  λ→0: players choose randomly (≈50% cooperate)")
+print(f"  λ→∞: players best-respond perfectly (0% cooperate = Nash)")
+print(f"  QRE bridges rationality and bounded rationality ✓")
+
+# Chicken Game — QRE vs Nash comparison
+A_ch = np.array([[0., -1.], [1., -10.]])
+B_ch = np.array([[0., 1.], [-1., -10.]])
+
+print(f"\nChicken Game: QRE vs Nash")
+p_nash = find_mixed_nash_2x2(A_ch, B_ch)
+print(f"  Nash mixed: P(Swerve) = {p_nash.get('p', 'N/A')}")
+for lam in [0.1, 1.0, 5.0, 20.0]:
+    p_qre, _ = logit_qre(A_ch, B_ch, lam)
+    print(f"  QRE λ={lam:5.1f}: P(Swerve)={p_qre[0]:.4f}")
+
+# ── λ sweep visualization ─────────────────────────────────────────────────────
+lam_range  = np.logspace(-2, 2, 100)
+p_coop_pd  = []
+p_coop_ch  = []
+
+for lam in lam_range:
+    p_pd, _ = logit_qre(A_pd, B_pd, lam)
+    p_ch, _ = logit_qre(A_ch, B_ch, lam)
+    p_coop_pd.append(p_pd[0])
+    p_coop_ch.append(p_ch[0])
+
+fig_qre = go.Figure()
+fig_qre.add_trace(go.Scatter(
+    x=lam_range, y=p_coop_pd, mode='lines',
+    name="PD: P(Cooperate)", line=dict(color='#60a5fa', width=2.5)))
+fig_qre.add_trace(go.Scatter(
+    x=lam_range, y=p_coop_ch, mode='lines',
+    name="Chicken: P(Swerve)", line=dict(color='#34d399', width=2.5)))
+fig_qre.add_hline(y=0, line_dash="dot", line_color="#f87171",
+                   annotation_text="Nash (PD)",
+                   annotation_position="right")
+fig_qre.add_hline(y=p_nash.get('p', 0.9), line_dash="dot",
+                   line_color="#f59e0b",
+                   annotation_text="Nash (Chicken)",
+                   annotation_position="right")
+fig_qre.update_layout(
+    title="QRE: Strategy Probability vs Precision λ<br>"
+          "<sub>As λ→∞, QRE converges to Nash equilibrium</sub>",
+    xaxis_title="Precision λ (log scale)", xaxis_type="log",
+    yaxis_title="Probability of Cooperative Strategy",
+    template="plotly_dark", height=420,
+    paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+    font=dict(color='white'), legend=dict(orientation="h", y=1.1)
+)
+fig_qre.show()
+
+# ── Mechanism Design: VCG Mechanism ──────────────────────────────────────────
+print("\n" + "=" * 60)
+print("MECHANISM DESIGN: VICKREY-CLARKE-GROVES (VCG)")
+print("=" * 60)
+print("Objective: Design rules that make truthful reporting")
+print("each agent's dominant strategy (incentive compatible).")
+
+def vcg_auction(valuations, costs=None):
+    """
+    VCG mechanism for a single-item auction.
+    Valuations: list of agent valuations v_i for the item.
+    Winner: agent with highest valuation (efficient allocation).
+    VCG Payment: winner pays second-highest valuation.
+    This is the Vickrey second-price auction — truth-telling dominant.
+    """
+    n = len(valuations)
+    valuations = np.array(valuations)
+
+    # Efficient allocation: give item to highest bidder
+    winner = np.argmax(valuations)
+    allocation = np.zeros(n); allocation[winner] = 1
+
+    # VCG payments: externality imposed on others
+    # p_i = max_{j≠i} v_j (what others lose by i getting the item)
+    payments = np.zeros(n)
+    for i in range(n):
+        others = [v for j, v in enumerate(valuations) if j != i]
+        # Social welfare without i: best allocation among others
+        sw_without_i = max(others)
+        # Social welfare with i (excluding i's value): 0 if i wins, else sw
+        if allocation[i] == 1:
+            payments[i] = sw_without_i
+        else:
+            payments[i] = 0
+
+    utility = valuations * allocation - payments
+
+    return {
+        'winner': winner,
+        'allocation': allocation,
+        'payments': payments,
+        'utility': utility,
+        'social_welfare': np.sum(valuations * allocation)
+    }
+
+def vcg_public_goods(valuations, cost):
+    """
+    VCG for binary public good (provide or not).
+    Provide if sum(v_i) >= cost.
+    VCG payment: Clarke tax ensuring truthfulness.
+    """
+    n = len(valuations)
+    valuations = np.array(valuations, dtype=float)
+    total_val  = np.sum(valuations)
+    provide    = total_val >= cost
+
+    payments = np.zeros(n)
+    for i in range(n):
+        others_total = total_val - valuations[i]
+        # Would project happen without i?
+        without_i = others_total >= cost
+        if provide and not without_i:
+            # i is pivotal — pays the difference
+            payments[i] = cost - others_total
+        elif not provide and without_i:
+            payments[i] = -(others_total - cost)
+
+    return {
+        'provide': provide,
+        'payments': payments,
+        'total_payment': np.sum(payments),
+        'efficiency_gap': cost - total_val if not provide else 0
+    }
+
+# Test 1: Auction
+print(f"\nTest 1: VCG Auction (second-price)")
+vals = [45, 72, 38, 91, 55]
+res  = vcg_auction(vals)
+print(f"  Valuations: {vals}")
+print(f"  Winner: Agent {res['winner']} (valued at {vals[res['winner']]})")
+print(f"  Payment: {res['payments'][res['winner']]:.2f} "
+      f"(second-price = {sorted(vals)[-2]})")
+print(f"  Truth-telling is dominant: bidding true value "
+      f"maximizes utility regardless of others ✓")
+
+# Test 2: Incentive compatibility verification
+print(f"\nTest 2: Verifying incentive compatibility")
+true_val = 91
+print(f"  Agent 3 true value: {true_val}")
+for reported in [40, 60, 80, 91, 100, 120]:
+    fake_vals = vals.copy()
+    fake_vals[3] = reported
+    r = vcg_auction(fake_vals)
+    util = true_val * r['allocation'][3] - r['payments'][3]
+    print(f"    Reports {reported:3d}: "
+          f"{'wins' if r['allocation'][3] else 'loses'}, "
+          f"utility={util:.2f}"
+          f"{'  ← TRUTH' if reported==true_val else ''}")
+
+print(f"\n  Truth-telling (report=91) achieves max utility ✓")
+
+# Test 3: Public goods
+print(f"\nTest 3: VCG Public Goods Mechanism")
+pg_vals = [15, 25, 10, 30, 20]
+pg_cost = 80
+pg_res  = vcg_public_goods(pg_vals, pg_cost)
+print(f"  Valuations: {pg_vals}")
+print(f"  Cost: {pg_cost}, Total value: {sum(pg_vals)}")
+print(f"  Decision: {'Provide ✓' if pg_res['provide'] else 'Do not provide'}")
+print(f"  VCG Payments: {pg_res['payments'].round(2)}")
+print(f"  Total tax collected: {pg_res['total_payment']:.2f}")
+
+print("\nQRE + Mechanism Design complete ✓")

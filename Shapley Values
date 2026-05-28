@@ -1,0 +1,180 @@
+import numpy as np
+import itertools
+import pandas as pd
+import plotly.graph_objects as go
+from math import factorial
+
+# ── Exact Shapley Value ───────────────────────────────────────────────────────
+def shapley_value(v, n):
+    """
+    Exact Shapley value computation.
+    v: characteristic function v(S) → value of coalition S
+       S represented as frozenset of player indices
+    n: number of players
+    Returns array of Shapley values φ_i for each player i.
+    """
+    players = list(range(n))
+    phi     = np.zeros(n)
+
+    for i in players:
+        others  = [p for p in players if p != i]
+        for r in range(len(others) + 1):
+            for S_list in itertools.combinations(others, r):
+                S      = frozenset(S_list)
+                S_with = frozenset(S_list + (i,))
+                # Marginal contribution of i to coalition S
+                marginal = v(S_with) - v(S)
+                # Weight: |S|!(n-|S|-1)!/n!
+                weight = (factorial(len(S)) *
+                          factorial(n - len(S) - 1) /
+                          factorial(n))
+                phi[i] += weight * marginal
+
+    return phi
+
+
+def monte_carlo_shapley(v, n, n_samples=10000):
+    """
+    Monte Carlo approximation for large n.
+    Randomly permute players and compute marginal contributions.
+    """
+    players = list(range(n))
+    phi     = np.zeros(n)
+
+    for _ in range(n_samples):
+        perm = np.random.permutation(players)
+        coalition = frozenset()
+        for i in perm:
+            coalition_with = coalition | {i}
+            phi[i] += v(coalition_with) - v(coalition)
+            coalition = coalition_with
+
+    return phi / n_samples
+
+
+# ── Economic Examples ─────────────────────────────────────────────────────────
+print("=" * 60)
+print("SHAPLEY VALUE CALCULATOR")
+print("=" * 60)
+
+# Example 1: Simple production game
+# Three workers with complementary skills
+# Value generated depends on combination
+def production_game(S):
+    """
+    Worker 0: programmer, Worker 1: designer, Worker 2: manager
+    v({0,1}) = 50 (programmer+designer build product)
+    v({0,2}) = 30 (programmer+manager plan)
+    v({1,2}) = 20 (designer+manager present)
+    v({0,1,2}) = 100 (full team)
+    """
+    s = set(S)
+    if s == {0,1,2}: return 100
+    if s == {0,1}:   return 50
+    if s == {0,2}:   return 30
+    if s == {1,2}:   return 20
+    if s == {0}:     return 10
+    if s == {1}:     return 5
+    if s == {2}:     return 8
+    return 0
+
+phi = shapley_value(production_game, 3)
+print(f"\nExample 1: Production Game")
+print(f"  Total value: {production_game(frozenset([0,1,2]))}")
+print(f"  Shapley values:")
+names = ['Programmer','Designer','Manager']
+for i, (name, p) in enumerate(zip(names, phi)):
+    print(f"    {name}: φ={p:.2f} ({p/sum(phi)*100:.1f}%)")
+print(f"  Sum of Shapley values = {sum(phi):.2f} "
+      f"(= total value ✓ efficiency axiom)")
+
+# Example 2: Voting game
+def voting_game(S):
+    """Weighted majority: Player 0 has 3 votes, 1 has 2, 2 has 1.
+    Win requires 4+ votes."""
+    weights = {0: 3, 1: 2, 2: 1}
+    total = sum(weights[i] for i in S)
+    return 1 if total >= 4 else 0
+
+phi_v = shapley_value(voting_game, 3)
+print(f"\nExample 2: Weighted Voting Game (3,2,1 votes; quota=4)")
+print(f"  Shapley-Shubik power indices:")
+for i, p in enumerate(phi_v):
+    print(f"    Player {i} ({[3,2,1][i]} votes): {p:.4f} ({p*100:.1f}%)")
+
+# ── SHAP Connection ───────────────────────────────────────────────────────────
+print(f"\n{'='*60}")
+print("SHAP CONNECTION: Shapley Values in Machine Learning")
+print(f"{'='*60}")
+
+# Train a small linear model and compute SHAP values two ways:
+# 1. Game-theoretic Shapley value treating features as players
+# 2. Show they're identical
+
+from sklearn.linear_model import LinearRegression
+import numpy as np
+
+np.random.seed(42)
+n_samples = 200
+X = np.random.randn(n_samples, 3)
+# True relationship: Y = 2*X0 + 5*X1 - 1*X2 + noise
+y = 2*X[:,0] + 5*X[:,1] - 1*X[:,2] + np.random.randn(n_samples)*0.5
+
+model = LinearRegression().fit(X, y)
+print(f"\nModel: Y = {model.coef_[0]:.2f}*X₀ + "
+      f"{model.coef_[1]:.2f}*X₁ + {model.coef_[2]:.2f}*X₂")
+print(f"True:  Y = 2.00*X₀ + 5.00*X₁ + (-1.00)*X₂")
+
+# Compute Shapley values for a single prediction
+x_explain = X[0]
+baseline  = y.mean()
+
+def model_value(S, x=x_explain, X_bg=X, model=model):
+    """
+    Value function for SHAP: E[model(x) | x_S = x_S]
+    Features in S are observed; others integrated over background.
+    """
+    if len(S) == 0:
+        return baseline
+    S = list(S)
+    X_perm = X_bg.copy()
+    for i in S:
+        X_perm[:, i] = x[i]
+    return model.predict(X_perm).mean()
+
+phi_ml = shapley_value(model_value, 3)
+print(f"\nSHAP values for observation x₀:")
+print(f"  Model prediction: {model.predict([x_explain])[0]:.4f}")
+print(f"  Baseline (mean):  {baseline:.4f}")
+feat_names = ['X₀ (coef≈2)', 'X₁ (coef≈5)', 'X₂ (coef≈-1)']
+for i, (name, p) in enumerate(zip(feat_names, phi_ml)):
+    print(f"  {name}: SHAP={p:+.4f}")
+print(f"  Sum of SHAP + baseline = "
+      f"{sum(phi_ml)+baseline:.4f} = prediction ✓")
+print(f"\n  Key insight: SHAP values are Shapley values from")
+print(f"  cooperative game theory applied to ML features.")
+print(f"  Same mathematical object, different domain.")
+print(f"  This is why SHAP satisfies efficiency, symmetry,")
+print(f"  dummy, and additivity — the four Shapley axioms.")
+
+# ── Waterfall visualization ───────────────────────────────────────────────────
+fig_shap = go.Figure(go.Waterfall(
+    name="SHAP",
+    orientation="v",
+    measure=["absolute"] + ["relative"]*3 + ["total"],
+    x=["Baseline", "X₀ (prog.)", "X₁ (design.)", "X₂ (mgr.)", "Prediction"],
+    y=[baseline, phi_ml[0], phi_ml[1], phi_ml[2], 0],
+    connector=dict(line=dict(color='#374151')),
+    increasing=dict(marker=dict(color='#34d399')),
+    decreasing=dict(marker=dict(color='#f87171')),
+    totals=dict(marker=dict(color='#60a5fa'))
+))
+fig_shap.update_layout(
+    title="SHAP Waterfall: Shapley Values for ML Feature Attribution",
+    template="plotly_dark", height=420,
+    paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+    font=dict(color='white'), yaxis_title="Prediction Value"
+)
+fig_shap.show()
+
+print("\nShapley values complete ✓")

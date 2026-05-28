@@ -1,0 +1,9 @@
+numpy 
+scipy 
+pandas 
+plotly 
+streamlit 
+networkx 
+pulp
+stable_baselines3 
+gymnasium

@@ -1,0 +1,909 @@
+%%writefile game_theory_dashboard.py
+import streamlit as st
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.optimize import linprog, minimize
+from scipy.integrate import solve_ivp
+import networkx as nx
+import itertools
+from math import factorial
+import warnings
+warnings.filterwarnings('ignore')
+
+st.set_page_config(page_title="Game Theory Simulator",
+                   layout="wide", page_icon="♟️",
+                   initial_sidebar_state="expanded")
+
+st.markdown("""
+<style>
+  .stApp{background:#0e1117;color:#fafafa}
+  [data-testid="stSidebar"]{background:#161b22}
+  .metric-card{background:linear-gradient(135deg,#1f2937,#111827);
+    border:1px solid #374151;border-radius:12px;
+    padding:1rem;text-align:center;margin-bottom:.5rem}
+  .metric-value{font-size:1.5rem;font-weight:800;color:#60a5fa}
+  .metric-label{font-size:.75rem;color:#9ca3af;margin-top:.3rem}
+  .sh{background:linear-gradient(90deg,#1e3a5f,#0e1117);
+    border-left:4px solid #3b82f6;padding:.6rem 1rem;
+    border-radius:0 8px 8px 0;margin:1rem 0 .5rem 0;
+    font-size:1rem;font-weight:700;color:#93c5fd}
+</style>
+""", unsafe_allow_html=True)
+
+# ── All core functions ────────────────────────────────────────────────────────
+def find_pure_nash(A, B):
+    eq = []
+    for r in range(A.shape[0]):
+        for c in range(A.shape[1]):
+            if A[r,c]==np.max(A[:,c]) and B[r,c]==np.max(B[r,:]):
+                eq.append((r,c,A[r,c],B[r,c]))
+    return eq
+
+def find_mixed_nash_2x2(A, B):
+    res = {}
+    dp = B[0,0]-B[1,0]-B[0,1]+B[1,1]
+    dq = A[0,0]-A[0,1]-A[1,0]+A[1,1]
+    if abs(dp)>1e-10:
+        p=(B[1,1]-B[1,0])/dp
+        if 0<=p<=1: res['p']=round(p,4)
+    if abs(dq)>1e-10:
+        q=(A[1,1]-A[0,1])/dq
+        if 0<=q<=1: res['q']=round(q,4)
+    return res
+
+def find_correlated_eq(A, B):
+    n,m=A.shape; nv=n*m
+    c_obj=-(A+B).flatten()
+    A_ub=[]; b_ub=[]
+    for r in range(n):
+        for r2 in range(n):
+            if r==r2: continue
+            row=np.zeros(nv)
+            for c in range(m): row[r*m+c]=-(A[r,c]-A[r2,c])
+            A_ub.append(row); b_ub.append(0)
+    for c in range(m):
+        for c2 in range(m):
+            if c==c2: continue
+            row=np.zeros(nv)
+            for r in range(n): row[r*m+c]=-(B[r,c]-B[r,c2])
+            A_ub.append(row); b_ub.append(0)
+    try:
+        res=linprog(c_obj,A_ub=np.array(A_ub),b_ub=np.array(b_ub),
+                    A_eq=np.ones((1,nv)),b_eq=[1.],
+                    bounds=[(0,None)]*nv,method='highs')
+        if res.success:
+            p=res.x.reshape(n,m)
+            return p,np.sum(p*(A+B))
+    except: pass
+    return None,None
+
+def replicator_rhs(t, x, A):
+    f=A@x; fbar=x@f
+    return x*(f-fbar)
+
+def run_replicator(A, x0, t_max=15, n_pts=500):
+    sol=solve_ivp(replicator_rhs,(0,t_max),x0,
+                  t_eval=np.linspace(0,t_max,n_pts),
+                  args=(A,),method='RK45',rtol=1e-8)
+    return sol.t,sol.y.T
+
+def shapley_value_fn(v, n):
+    players=list(range(n)); phi=np.zeros(n)
+    for i in players:
+        others=[p for p in players if p!=i]
+        for r in range(len(others)+1):
+            for S_list in itertools.combinations(others,r):
+                S=frozenset(S_list); Sw=frozenset(S_list+(i,))
+                w=(factorial(len(S))*factorial(n-len(S)-1)/factorial(n))
+                phi[i]+=w*(v(Sw)-v(S))
+    return phi
+
+def logit_qre_fn(A, B, lam, max_iter=500):
+    n,m=A.shape
+    p=np.ones(n)/n; q=np.ones(m)/m
+    for _ in range(max_iter):
+        eu_r=A@q; eu_c=B.T@p
+        pn=np.exp(lam*eu_r); pn/=pn.sum()
+        qn=np.exp(lam*eu_c); qn/=qn.sum()
+        if np.max(np.abs(pn-p))<1e-10 and np.max(np.abs(qn-q))<1e-10: break
+        p,q=pn,qn
+    return p,q
+
+def vcg_auction_fn(vals):
+    vals=np.array(vals,dtype=float); winner=np.argmax(vals)
+    alloc=np.zeros(len(vals)); alloc[winner]=1
+    pay=np.zeros(len(vals))
+    pay[winner]=max(v for j,v in enumerate(vals) if j!=winner)
+    return winner,pay,alloc
+
+class CournotEnv:
+    def __init__(self,a=100,b=1,c=10):
+        self.a=a;self.b=b;self.c=c
+    def profit(self,q1,q2):
+        P=max(0,self.a-self.b*(q1+q2))
+        return (P-self.c)*q1,(P-self.c)*q2
+    def best_response(self,q_other):
+        return max(0,(self.a-self.c-self.b*q_other)/(2*self.b))
+    @property
+    def q_nash(self): return (self.a-self.c)/(3*self.b)
+
+class GradientAgent:
+    def __init__(self,q0=20.,lr=0.08,sig=3.):
+        self.mu=float(q0);self.lr=lr;self.sigma=sig
+        self.hist_mu=[float(q0)];self.hist_pi=[]
+    def act(self):
+        return float(np.clip(np.random.normal(self.mu,self.sigma),0,80))
+    def update(self,q,pi):
+        grad=(q-self.mu)/(self.sigma**2)*pi
+        self.mu=float(np.clip(self.mu+self.lr*grad,0,80))
+        self.sigma=max(0.5,self.sigma*0.9995)
+        self.hist_mu.append(self.mu);self.hist_pi.append(pi)
+
+COLORS=['#60a5fa','#34d399','#f59e0b','#f87171','#a78bfa','#fb923c']
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ♟️ Game Theory Simulator")
+    st.markdown("*8 modules · Nobel Prize mathematics*")
+    st.divider()
+    for m in ["Nash Equilibrium Solver","Correlated Equilibrium (Nobel 2005)",
+              "Classic Games (PD, Cournot, Public Goods)",
+              "Evolutionary Replicator Dynamics",
+              "Shapley Values + SHAP Connection (Nobel 2012)",
+              "Network Games on Graphs",
+              "Quantal Response Equilibrium",
+              "Mechanism Design — VCG (Nobel 2007)",
+              "Multi-Agent RL (MAKOTO Extension)"]:
+        st.markdown(f"· {m}")
+    st.divider()
+    st.markdown("**Nubaid Khan** | Game Theory Simulator")
+
+# ── Tabs ──────────────────────────────────────────────────────────────────────
+tabs=st.tabs([
+    "📋 Overview",
+    "🎯 Nash Solver",
+    "🎮 Classic Games",
+    "🧬 Evolutionary",
+    "🔷 Shapley + SHAP",
+    "🕸️ Network Games",
+    "🎲 QRE",
+    "⚙️ Mechanism Design",
+    "🤖 Multi-Agent RL"
+])
+
+# ── TAB 0: Overview ───────────────────────────────────────────────────────────
+with tabs[0]:
+    st.markdown("# Game Theory Simulator")
+    st.markdown("*From Nash equilibrium to mechanism design — computational game theory across 8 modules*")
+    st.divider()
+
+    c1,c2,c3,c4=st.columns(4)
+    for col,(label,val) in zip([c1,c2,c3,c4],[
+        ("Modules","8"),("Nobel Prizes Connected","4"),
+        ("Equilibrium Concepts","5"),("Algorithms","7+")
+    ]):
+        col.markdown(f"<div class='metric-card'>"
+                     f"<div class='metric-value'>{val}</div>"
+                     f"<div class='metric-label'>{label}</div>"
+                     f"</div>",unsafe_allow_html=True)
+
+    st.markdown("")
+    st.markdown("<div class='sh'>Module Map</div>",unsafe_allow_html=True)
+    overview_df=pd.DataFrame({
+        'Module':["Nash Solver","Classic Games","Evolutionary",
+                  "Shapley + SHAP","Network Games","QRE",
+                  "Mechanism Design","Multi-Agent RL"],
+        'Nobel Connection':["Nash (1994)","Card & Krueger (2021)",
+                            "Maynard Smith (not Nobel but foundational)",
+                            "Shapley (2012)","Network economics (2024-adjacent)",
+                            "Behavioral economics (Thaler 2017)",
+                            "Hurwicz, Maskin, Myerson (2007)",
+                            "MAKOTO extension"],
+        'Key Concept':["Pure + Mixed + Correlated Eq.",
+                       "PD, Cournot, Public Goods",
+                       "Replicator dynamics ODE",
+                       "Fair value division + ML explainability",
+                       "Topology changes equilibrium",
+                       "Bounded rationality extension of Nash",
+                       "VCG + truthful mechanism",
+                       "Gradient ascent + fictitious play"],
+        'Innovative':["Correlated Eq. via LP ✓",
+                      "Iterated tournament ✓",
+                      "Simplex phase portrait ✓",
+                      "SHAP bridge ✓",
+                      "5 topologies compared ✓",
+                      "λ-sweep visualization ✓",
+                      "IC verification ✓",
+                      "Collusion detection ✓"]
+    })
+    st.dataframe(overview_df,use_container_width=True,hide_index=True)
+
+    st.markdown("<div class='sh'>Connection to MAKOTO</div>",
+                unsafe_allow_html=True)
+    st.markdown("""
+MAKOTO's stated limitation (Section VI) was its **single-agent design** — one planner
+optimizing global policy as if no strategic interactions existed between countries.
+This simulator directly builds what MAKOTO needs next:
+
+- **Multi-Agent RL tab**: Two PPO-style agents learning Cournot competition —
+  the same framework extended to N country-agents
+- **Mechanism Design tab**: VCG mechanisms that could coordinate country-level
+  policy without requiring a single global planner
+- **Network Games tab**: Public goods provision on graphs — models international
+  cooperation where payoffs depend on which countries are allies
+
+This is a documented research arc: MAKOTO identified the gap; this project builds the solution.
+    """)
+
+# ── TAB 1: Nash Solver ────────────────────────────────────────────────────────
+with tabs[1]:
+    st.markdown("# Nash Equilibrium Solver")
+    st.markdown("*Pure · Mixed · Correlated — all three equilibrium concepts in one solver*")
+    st.divider()
+
+    preset=st.selectbox("Load preset:",
+        ["Custom","Prisoner's Dilemma","Chicken",
+         "Battle of the Sexes","Stag Hunt","Matching Pennies"])
+
+    presets={
+        "Prisoner's Dilemma":([[-1,-3],[0,-2]],[[-1,0],[-3,-2]],
+            ["Cooperate","Defect"],["Cooperate","Defect"]),
+        "Chicken":([[0,-1],[1,-10]],[[0,1],[-1,-10]],
+            ["Swerve","Straight"],["Swerve","Straight"]),
+        "Battle of the Sexes":([[3,0],[0,1]],[[1,0],[0,3]],
+            ["Opera","Football"],["Opera","Football"]),
+        "Stag Hunt":([[4,0],[3,3]],[[4,3],[0,3]],
+            ["Stag","Hare"],["Stag","Hare"]),
+        "Matching Pennies":([[1,-1],[-1,1]],[[-1,1],[1,-1]],
+            ["Heads","Tails"],["Heads","Tails"]),
+    }
+
+    if preset!="Custom":
+        A_d,B_d,rl,cl=presets[preset]
+    else:
+        A_d=[[3,0],[0,5]];B_d=[[3,5],[0,0]];rl=["Up","Down"];cl=["Left","Right"]
+
+    c1,c2=st.columns(2)
+    A_in=[]
+    with c1:
+        st.markdown("**Row Player (A)**")
+        for i in range(len(rl)):
+            row=[];cs=st.columns(len(cl))
+            for j,col in enumerate(cs):
+                v=col.number_input(f"A{i}{j}",value=float(A_d[i][j]),
+                    key=f"A{i}{j}",label_visibility="collapsed")
+                row.append(v)
+            A_in.append(row)
+    B_in=[]
+    with c2:
+        st.markdown("**Col Player (B)**")
+        for i in range(len(rl)):
+            row=[];cs=st.columns(len(cl))
+            for j,col in enumerate(cs):
+                v=col.number_input(f"B{i}{j}",value=float(B_d[i][j]),
+                    key=f"B{i}{j}",label_visibility="collapsed")
+                row.append(v)
+            B_in.append(row)
+
+    A=np.array(A_in,dtype=float)
+    B=np.array(B_in,dtype=float)
+
+    if st.button("Solve",type="primary"):
+        pure=find_pure_nash(A,B)
+        mixed=find_mixed_nash_2x2(A,B)
+        ce,sw=find_correlated_eq(A,B)
+
+        c1,c2,c3=st.columns(3)
+        c1.metric("Pure Nash",str(len(pure)))
+        c2.metric("Mixed Nash","Exists" if mixed else "N/A")
+        c3.metric("Correlated SW",f"{sw:.3f}" if sw else "N/A")
+
+        st.markdown("<div class='sh'>Pure Strategy Nash</div>",
+                    unsafe_allow_html=True)
+        if pure:
+            for r,c,ar,bc in pure:
+                st.success(f"**({rl[r]}, {cl[c]})** → Row={ar}, Col={bc}")
+        else:
+            st.warning("No pure strategy Nash — mixed equilibrium only")
+
+        if mixed:
+            st.markdown("<div class='sh'>Mixed Strategy Nash</div>",
+                        unsafe_allow_html=True)
+            if 'p' in mixed:
+                st.write(f"Row: **{mixed['p']}** on {rl[0]}, "
+                         f"**{round(1-mixed['p'],4)}** on {rl[1]}")
+            if 'q' in mixed:
+                st.write(f"Col: **{mixed['q']}** on {cl[0]}, "
+                         f"**{round(1-mixed['q'],4)}** on {cl[1]}")
+
+        if ce is not None:
+            st.markdown("<div class='sh'>Correlated Equilibrium "
+                        "(Aumann 2005 Nobel)</div>",
+                        unsafe_allow_html=True)
+            st.dataframe(pd.DataFrame(ce.round(4),index=rl,columns=cl),
+                         use_container_width=True)
+            nash_sw=max(A[r,c]+B[r,c] for r,c,_,_ in pure) if pure else 0
+            if sw>nash_sw+0.001:
+                st.success(f"Correlation improves social welfare by "
+                           f"{sw-nash_sw:.4f} over best Nash ✓")
+            else:
+                st.info("Correlated equilibrium matches Nash welfare here")
+
+# ── TAB 2: Classic Games ──────────────────────────────────────────────────────
+with tabs[2]:
+    st.markdown("# Classic Games")
+    st.divider()
+
+    gtab=st.radio("",["Prisoner's Dilemma","Cournot Oligopoly",
+                       "Public Goods"],horizontal=True)
+
+    if gtab=="Prisoner's Dilemma":
+        st.markdown("### Iterated Prisoner's Dilemma Tournament")
+        STRATS={
+            'Always Defect':    lambda h:'D',
+            'Always Cooperate': lambda h:'C',
+            'Tit-for-Tat':      lambda h:h[-1] if h else 'C',
+            'Grim Trigger':     lambda h:'D' if 'D' in h else 'C',
+            'Random':           lambda h:np.random.choice(['C','D']),
+        }
+        c1,c2=st.columns(2)
+        s1n=c1.selectbox("Player 1",list(STRATS.keys()),index=2)
+        s2n=c2.selectbox("Player 2",list(STRATS.keys()),index=0)
+        rds=st.slider("Rounds",10,200,60)
+
+        PAYOFF={('C','C'):(-1,-1),('C','D'):(-3,0),
+                ('D','C'):(0,-3),('D','D'):(-2,-2)}
+        s1=STRATS[s1n];s2=STRATS[s2n]
+        h1,h2,sc1,sc2=[],[],[],[]
+        np.random.seed(42)
+        for _ in range(rds):
+            a1=s1(h2);a2=s2(h1)
+            p1,p2=PAYOFF[(a1,a2)]
+            h1.append(a1);h2.append(a2);sc1.append(p1);sc2.append(p2)
+
+        fig=go.Figure()
+        fig.add_trace(go.Scatter(y=np.cumsum(sc1),mode='lines',
+            name=s1n,line=dict(color='#60a5fa',width=2.5)))
+        fig.add_trace(go.Scatter(y=np.cumsum(sc2),mode='lines',
+            name=s2n,line=dict(color='#34d399',width=2.5)))
+        fig.update_layout(xaxis_title="Round",yaxis_title="Cumulative Score",
+            template="plotly_dark",height=380,
+            paper_bgcolor="#0e1117",plot_bgcolor="#0e1117",font=dict(color='white'))
+        st.plotly_chart(fig,use_container_width=True)
+
+        coop1=h1.count('C')/rds; coop2=h2.count('C')/rds
+        c1,c2,c3=st.columns(3)
+        c1.metric(f"{s1n} cooperation rate",f"{coop1*100:.1f}%")
+        c2.metric(f"{s2n} cooperation rate",f"{coop2*100:.1f}%")
+        c3.metric("Scores",f"{sum(sc1)} vs {sum(sc2)}")
+
+    elif gtab=="Cournot Oligopoly":
+        st.markdown("### Cournot Duopoly — Best Response Curves")
+        c1,c2,c3=st.columns(3)
+        a=c1.slider("Demand (a)",50,200,100)
+        b=c2.slider("Slope (b)",1,5,1)
+        cost=c3.slider("Cost (c)",0,50,10)
+
+        env=CournotEnv(a=a,b=b,c=cost)
+        qn=env.q_nash
+        Pn=a-b*2*qn; pin=(Pn-cost)*qn
+
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric("Nash q*",f"{qn:.2f}")
+        c2.metric("Price P*",f"{Pn:.2f}")
+        c3.metric("Profit π*",f"{pin:.2f}")
+        c4.metric("vs Monopoly",f"{qn/((a-cost)/(2*b))*100:.0f}% of Q_m")
+
+        q_range=np.linspace(0,min(a/b,80),200)
+        br=[env.best_response(q) for q in q_range]
+        fig2=go.Figure()
+        fig2.add_trace(go.Scatter(x=q_range,y=br,mode='lines',
+            name='BR₁(q₂)',line=dict(color='#60a5fa',width=2.5)))
+        fig2.add_trace(go.Scatter(x=br,y=q_range,mode='lines',
+            name='BR₂(q₁)',line=dict(color='#34d399',width=2.5)))
+        fig2.add_trace(go.Scatter(x=[qn],y=[qn],mode='markers',
+            name='Nash Eq',
+            marker=dict(color='#f59e0b',size=14,symbol='star')))
+        fig2.add_trace(go.Scatter(
+            x=[(a-cost)/(2*b)],y=[0],mode='markers',name='Monopoly',
+            marker=dict(color='#f87171',size=10,symbol='diamond')))
+        fig2.update_layout(xaxis_title="q₁",yaxis_title="q₂",
+            template="plotly_dark",height=420,
+            paper_bgcolor="#0e1117",plot_bgcolor="#0e1117",font=dict(color='white'))
+        st.plotly_chart(fig2,use_container_width=True)
+
+    else:
+        st.markdown("### Public Goods Game — Free Rider Problem")
+        n_p=st.slider("Players",3,15,6)
+        ret=st.slider("MPCR (return rate)",1.0,3.0,1.6,0.1)
+        rds2=st.slider("Rounds",10,60,30)
+
+        contribs=np.ones(n_p)*5.0
+        hist_c,hist_p=[],[]
+        np.random.seed(42)
+        for _ in range(rds2):
+            total=np.sum(contribs); share=ret*total/n_p
+            payoff=10-contribs+share
+            hist_c.append(np.mean(contribs))
+            hist_p.append(np.mean(payoff))
+            best=np.argmax(payoff); nc=contribs.copy()
+            for i in range(n_p):
+                if payoff[i]<np.mean(payoff):
+                    nc[i]=contribs[best]*.7+contribs[i]*.3+np.random.normal(0,.3)
+                nc[i]=np.clip(nc[i],0,10)
+            contribs=nc
+
+        fig3=make_subplots(rows=1,cols=2,
+            subplot_titles=["Avg Contribution","Avg Payoff"])
+        fig3.add_trace(go.Scatter(y=hist_c,mode='lines',
+            line=dict(color='#60a5fa',width=2.5),showlegend=False),row=1,col=1)
+        fig3.add_hline(y=0,line_dash="dot",line_color="#f87171",
+                       annotation_text="Nash (0)",row=1,col=1)
+        fig3.add_hline(y=10,line_dash="dot",line_color="#34d399",
+                       annotation_text="Optimum (10)",row=1,col=1)
+        fig3.add_trace(go.Scatter(y=hist_p,mode='lines',
+            line=dict(color='#34d399',width=2.5),showlegend=False),row=1,col=2)
+        fig3.update_layout(template="plotly_dark",height=380,
+            paper_bgcolor="#0e1117",plot_bgcolor="#0e1117",font=dict(color='white'))
+        st.plotly_chart(fig3,use_container_width=True)
+        st.info(f"MPCR={ret:.1f}. Nash prediction: zero contribution. "
+                f"{'With learning, cooperation partially emerges.' if ret>1 else 'No incentive to cooperate.'}")
+
+# ── TAB 3: Evolutionary ───────────────────────────────────────────────────────
+with tabs[3]:
+    st.markdown("# Evolutionary Game Theory")
+    st.markdown("*Replicator dynamics: strategies evolve by selection pressure, not rationality*")
+    st.divider()
+
+    EVO={
+        "Prisoner's Dilemma":(np.array([[-1.,-3.],[0.,-2.]]),
+            ['Cooperate','Defect'],"All-Defect is ESS"),
+        "Hawk-Dove":(np.array([[0.,3.],[1.,2.]]),
+            ['Hawk','Dove'],"Mixed equilibrium — both coexist"),
+        "Stag Hunt":(np.array([[4.,0.],[3.,3.]]),
+            ['Stag','Hare'],"Two stable equilibria"),
+        "Rock-Paper-Scissors":(np.array([[0.,-1.,1.],[1.,0.,-1.],[-1.,1.,0.]]),
+            ['Rock','Paper','Scissors'],"Neutrally stable cycles"),
+    }
+
+    gevo=st.selectbox("Game:",list(EVO.keys()))
+    A_evo,strats,pred=EVO[gevo]
+    n_s=len(strats)
+    st.info(f"**Prediction:** {pred}")
+
+    c1,c2=st.columns(2)
+    x0=[]
+    for i,s in enumerate(strats):
+        v=c1.slider(f"Initial {s}",0.0,1.0,1.0/n_s,0.05,key=f"e{i}")
+        x0.append(v)
+    x0=np.array(x0,dtype=float)
+    x0=x0/x0.sum() if x0.sum()>0 else np.ones(n_s)/n_s
+    t_max=c2.slider("Time",5,40,15)
+
+    t,X=run_replicator(A_evo,x0,t_max=t_max)
+
+    fig_evo=go.Figure()
+    for i,s in enumerate(strats):
+        fig_evo.add_trace(go.Scatter(x=t,y=X[:,i],mode='lines',
+            name=s,line=dict(color=COLORS[i],width=2.5)))
+    fig_evo.update_layout(xaxis_title="Time",yaxis_title="Population Share",
+        template="plotly_dark",height=420,
+        paper_bgcolor="#0e1117",plot_bgcolor="#0e1117",font=dict(color='white'),
+        legend=dict(orientation="h",y=1.1))
+    st.plotly_chart(fig_evo,use_container_width=True)
+
+    if n_s==3:
+        st.markdown("<div class='sh'>Simplex Phase Portrait</div>",
+                    unsafe_allow_html=True)
+        def b2c(x):
+            v=np.array([[0.,0.],[1.,0.],[.5,np.sqrt(3)/2]])
+            return x[0]*v[0]+x[1]*v[1]+x[2]*v[2]
+
+        fig_s=go.Figure()
+        corners=np.array([[1,0,0],[0,1,0],[0,0,1],[1,0,0]],dtype=float)
+        cart=np.array([b2c(c) for c in corners])
+        fig_s.add_trace(go.Scatter(x=cart[:,0],y=cart[:,1],mode='lines',
+            line=dict(color='#374151',width=2),showlegend=False))
+        for i,(s,corner) in enumerate(zip(strats,[[1,0,0],[0,1,0],[0,0,1]])):
+            pos=b2c(np.array(corner,dtype=float))
+            fig_s.add_annotation(x=pos[0],y=pos[1]+.05,text=s,
+                font=dict(color=COLORS[i],size=13),showarrow=False)
+        np.random.seed(42)
+        for _ in range(20):
+            raw=np.random.dirichlet(np.ones(3))
+            t2,X2=run_replicator(A_evo,raw,t_max=10,n_pts=200)
+            ct=np.array([b2c(X2[i]) for i in range(len(t2))])
+            fig_s.add_trace(go.Scatter(x=ct[:,0],y=ct[:,1],mode='lines',
+                line=dict(color='rgba(96,165,250,0.35)',width=1.2),showlegend=False))
+        ctr=b2c(np.array([1/3,1/3,1/3]))
+        fig_s.add_trace(go.Scatter(x=[ctr[0]],y=[ctr[1]],mode='markers',
+            name='Nash (1/3,1/3,1/3)',
+            marker=dict(color='#f59e0b',size=12,symbol='star')))
+        fig_s.update_layout(template="plotly_dark",height=480,
+            paper_bgcolor="#0e1117",plot_bgcolor="#0e1117",font=dict(color='white'),
+            xaxis=dict(showgrid=False,zeroline=False,showticklabels=False),
+            yaxis=dict(showgrid=False,zeroline=False,showticklabels=False,
+                       scaleanchor="x"))
+        st.plotly_chart(fig_s,use_container_width=True)
+
+# ── TAB 4: Shapley + SHAP ─────────────────────────────────────────────────────
+with tabs[4]:
+    st.markdown("# Shapley Values + SHAP Connection")
+    st.markdown("*Fair value division in cooperative games — and why it's the foundation of ML explainability*")
+    st.divider()
+
+    c1,c2,c3=st.columns(3)
+    v01=c1.slider("v({0,1})",0,100,50)
+    v02=c2.slider("v({0,2})",0,100,30)
+    v12=c3.slider("v({1,2})",0,100,20)
+    v012=st.slider("Grand coalition v({0,1,2})",0,200,100)
+
+    def cg(S):
+        s=set(S)
+        if s=={0,1,2}: return float(v012)
+        if s=={0,1}: return float(v01)
+        if s=={0,2}: return float(v02)
+        if s=={1,2}: return float(v12)
+        if s=={0}: return 10.
+        if s=={1}: return 5.
+        if s=={2}: return 8.
+        return 0.
+
+    phi=shapley_value_fn(cg,3)
+    pnames=['Programmer','Designer','Manager']
+
+    c1,c2,c3=st.columns(3)
+    for col,name,p in zip([c1,c2,c3],pnames,phi):
+        col.markdown(f"<div class='metric-card'>"
+                     f"<div class='metric-value'>{p:.2f}</div>"
+                     f"<div class='metric-label'>φ({name})</div>"
+                     f"</div>",unsafe_allow_html=True)
+
+    fig_phi=go.Figure(go.Bar(x=pnames,y=phi,
+        marker_color=['#60a5fa','#34d399','#f59e0b'],
+        text=[f"φ={p:.2f} ({p/max(sum(phi),1)*100:.1f}%)" for p in phi],
+        textposition='outside'))
+    fig_phi.add_hline(y=0,line_color="#6b7280",line_width=1)
+    fig_phi.update_layout(
+        title=f"Shapley Values — Grand Coalition = {v012}",
+        yaxis_title="φᵢ",template="plotly_dark",height=380,
+        paper_bgcolor="#0e1117",plot_bgcolor="#0e1117",font=dict(color='white'))
+    st.plotly_chart(fig_phi,use_container_width=True)
+    st.caption(f"Sum = {sum(phi):.2f} = {v012} ✓ efficiency axiom | "
+               f"All four Shapley axioms satisfied: efficiency, symmetry, dummy, additivity")
+
+    st.markdown("<div class='sh'>SHAP Bridge: Game Theory → Machine Learning</div>",
+                unsafe_allow_html=True)
+    col1,col2=st.columns(2)
+    with col1:
+        st.markdown("""
+**In cooperative game theory:**
+- Players decide whether to join coalitions
+- Value function v(S) = output of coalition S
+- Shapley value = fair share of grand coalition value
+
+**In machine learning (SHAP):**
+- Features are the "players"
+- Coalition = subset of features revealed to model
+- Value function = model's expected prediction given those features
+- SHAP value = each feature's fair attribution to the prediction
+
+**They are mathematically identical.** SHAP values satisfy the
+four Shapley axioms not by design coincidence but because
+Lundberg & Lee (2017) explicitly derived them from cooperative
+game theory. A 1953 economics result became the 2023 gold
+standard for AI explainability.
+        """)
+    with col2:
+        st.markdown("""
+**Connection to MAKOTO:**
+
+In MAKOTO, permutation-based feature importance measures
+how much each macroeconomic predictor contributes to
+forecast accuracy. This is a Shapley-adjacent method —
+approximating the Shapley value by sampling permutations
+rather than computing it exactly.
+
+The top MAKOTO predictor (lag_capital_form, ΔMAE=+0.0433)
+can be interpreted as having the highest Shapley value in
+the cooperative forecasting game where features are players
+and the grand coalition's value is forecast accuracy.
+
+Building the exact Shapley value calculator here makes that
+connection explicit and rigorous.
+        """)
+
+# ── TAB 5: Network Games ──────────────────────────────────────────────────────
+with tabs[5]:
+    st.markdown("# Network Games")
+    st.markdown("*Graph topology changes equilibrium — the same game produces different outcomes on different networks*")
+    st.divider()
+
+    c1,c2,c3=st.columns(3)
+    net=c1.selectbox("Topology",["Complete","Star","Random","Scale-Free","Small World"])
+    n_nd=c2.slider("Nodes",6,20,10)
+    ret_n=c3.slider("Return rate",1.0,3.0,1.6,0.1)
+
+    seed=42
+    if net=="Complete":    G=nx.complete_graph(n_nd)
+    elif net=="Star":      G=nx.star_graph(n_nd-1)
+    elif net=="Random":    G=nx.erdos_renyi_graph(n_nd,.4,seed=seed)
+    elif net=="Scale-Free":G=nx.barabasi_albert_graph(n_nd,2,seed=seed)
+    else:                  G=nx.watts_strogatz_graph(n_nd,4,.3,seed=seed)
+
+    pos=nx.spring_layout(G,seed=seed)
+    np.random.seed(42)
+    cs=np.random.uniform(3,7,n_nd)
+    for _ in range(30):
+        pf=np.zeros(n_nd)
+        for i in G.nodes:
+            nb=list(G.neighbors(i))
+            if not nb: pf[i]=10-cs[i]; continue
+            pool=cs[i]+sum(cs[j] for j in nb)
+            pf[i]=10-cs[i]+ret_n*pool/(len(nb)+1)
+        nc=cs.copy()
+        for i in G.nodes:
+            nb=list(G.neighbors(i))
+            if nb:
+                bst=nb[np.argmax([pf[j] for j in nb])]
+                if pf[bst]>pf[i]:
+                    nc[i]=cs[bst]*.7+cs[i]*.3+np.random.normal(0,.3)
+            nc[i]=np.clip(nc[i],0,10)
+        cs=nc
+
+    ex,ey=[],[]
+    for e in G.edges():
+        x0,y0=pos[e[0]];x1,y1=pos[e[1]]
+        ex+=[x0,x1,None];ey+=[y0,y1,None]
+    nxa=[pos[n][0] for n in G.nodes]
+    nya=[pos[n][1] for n in G.nodes]
+
+    fig_net=go.Figure()
+    fig_net.add_trace(go.Scatter(x=ex,y=ey,mode='lines',
+        line=dict(color='rgba(148,163,184,0.3)',width=1.5),showlegend=False))
+    fig_net.add_trace(go.Scatter(x=nxa,y=nya,mode='markers+text',
+        marker=dict(size=28,color=cs,colorscale='RdYlGn',
+                    colorbar=dict(title='Contribution'),cmin=0,cmax=10,
+                    line=dict(color='white',width=1.5)),
+        text=[f"{c:.1f}" for c in cs],
+        textfont=dict(color='black',size=9),showlegend=False))
+    fig_net.update_layout(
+        title=f"{net} Network — Final Contributions | Density={nx.density(G):.3f}",
+        template="plotly_dark",height=460,
+        paper_bgcolor="#0e1117",plot_bgcolor="#0e1117",font=dict(color='white'),
+        xaxis=dict(showgrid=False,zeroline=False,showticklabels=False),
+        yaxis=dict(showgrid=False,zeroline=False,showticklabels=False))
+    st.plotly_chart(fig_net,use_container_width=True)
+
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Avg Contribution",f"{np.mean(cs):.2f}")
+    c2.metric("Std Dev",f"{np.std(cs):.2f}")
+    c3.metric("Density",f"{nx.density(G):.3f}")
+    c4.metric("Avg Clustering",f"{nx.average_clustering(G):.3f}")
+
+# ── TAB 6: QRE ───────────────────────────────────────────────────────────────
+with tabs[6]:
+    st.markdown("# Quantal Response Equilibrium")
+    st.markdown("*Bounded rationality: players make mistakes, but better responses are chosen more often*")
+    st.divider()
+
+    c1,c2=st.columns(2)
+    gqre=c1.selectbox("Game:",
+        ["Prisoner's Dilemma","Chicken","Battle of the Sexes"])
+    lam=c2.slider("Precision λ",0.01,20.0,1.0,0.01)
+
+    qre_map={
+        "Prisoner's Dilemma":(
+            np.array([[-1.,-3.],[0.,-2.]]),
+            np.array([[-1.,0.],[-3.,-2.]]),["Cooperate","Defect"]),
+        "Chicken":(
+            np.array([[0.,-1.],[1.,-10.]]),
+            np.array([[0.,1.],[-1.,-10.]]),["Swerve","Straight"]),
+        "Battle of the Sexes":(
+            np.array([[3.,0.],[0.,1.]]),
+            np.array([[1.,0.],[0.,3.]]),["Opera","Football"]),
+    }
+    Aq,Bq,lbq=qre_map[gqre]
+    pq,_=logit_qre_fn(Aq,Bq,lam)
+    pn=find_mixed_nash_2x2(Aq,Bq)
+
+    c1,c2,c3=st.columns(3)
+    c1.metric(f"QRE P({lbq[0]})",f"{pq[0]:.4f}",f"λ={lam:.2f}")
+    c2.metric(f"Nash P({lbq[0]})",f"{pn.get('p','all-pure')}")
+    c3.metric("Rationality",
+              "Near-Nash" if lam>5 else "Bounded rational" if lam>0.5 else "Near-random")
+
+    lams=np.logspace(-2,np.log10(20),100)
+    psweep=[logit_qre_fn(Aq,Bq,l)[0][0] for l in lams]
+    fig_qr=go.Figure()
+    fig_qr.add_trace(go.Scatter(x=lams,y=psweep,mode='lines',
+        name='QRE',line=dict(color='#60a5fa',width=2.5)))
+    if 'p' in pn:
+        fig_qr.add_hline(y=pn['p'],line_dash="dash",line_color="#f59e0b",
+                          line_width=2,annotation_text=f"Nash={pn['p']}")
+    fig_qr.add_vline(x=lam,line_dash="dot",line_color="#34d399",line_width=1.5,
+                     annotation_text=f"Current λ={lam:.2f}")
+    fig_qr.update_layout(
+        title=f"QRE: P({lbq[0]}) vs Precision λ",
+        xaxis_title="λ (log scale)",xaxis_type="log",
+        yaxis_title=f"P({lbq[0]})",template="plotly_dark",height=400,
+        paper_bgcolor="#0e1117",plot_bgcolor="#0e1117",font=dict(color='white'))
+    st.plotly_chart(fig_qr,use_container_width=True)
+    st.info("As λ→∞ players become perfectly rational and QRE converges to Nash. "
+            "QRE consistently outperforms Nash in predicting actual human behavior "
+            "in experimental games.")
+
+# ── TAB 7: Mechanism Design ───────────────────────────────────────────────────
+with tabs[7]:
+    st.markdown("# Mechanism Design")
+    st.markdown("*Design the rules that make truth-telling dominant — Nobel 2007 (Hurwicz, Maskin, Myerson)*")
+    st.divider()
+
+    mech=st.radio("",["VCG Auction","Public Goods VCG"],horizontal=True)
+
+    if mech=="VCG Auction":
+        st.markdown("### Vickrey-Clarke-Groves Second-Price Auction")
+        n_b=st.slider("Bidders",2,8,5)
+        cols=st.columns(n_b)
+        dvals=[45,72,38,91,55,30,88,60]
+        vals=[col.number_input(f"Bidder {i}",0,200,dvals[i],
+              key=f"vcg{i}") for i,col in enumerate(cols)]
+
+        w,pay,alloc=vcg_auction_fn(vals)
+        c1,c2,c3=st.columns(3)
+        c1.metric("Winner",f"Bidder {w}")
+        c2.metric("VCG Payment",f"{pay[w]:.2f}")
+        c3.metric("Winner's Value",f"{vals[w]}")
+        st.success(f"Bidder {w} wins (value={vals[w]}), pays "
+                   f"{pay[w]:.0f} (second-highest = {sorted(vals)[-2]}). "
+                   f"Surplus = {vals[w]-pay[w]:.0f}")
+
+        st.markdown("<div class='sh'>Incentive Compatibility Proof</div>",
+                    unsafe_allow_html=True)
+        true_v=vals[w]; ic=[]
+        for rep in range(0,int(max(vals))+25,15):
+            fv=list(vals); fv[w]=rep
+            ww,pp,aa=vcg_auction_fn(fv)
+            util=true_v*aa[w]-pp[w]
+            ic.append({'Reported':rep,'Wins':bool(aa[w]),
+                       'Pays':round(pp[w],1),'Utility':round(util,1),
+                       'Truth?':'← MAX ✓' if rep==true_v else ''})
+        st.dataframe(pd.DataFrame(ic),use_container_width=True,hide_index=True)
+        st.caption("Utility is maximized at truthful report. VCG makes honesty a dominant strategy.")
+
+    else:
+        st.markdown("### Public Goods VCG — Clarke Tax Mechanism")
+        n_ag=st.slider("Agents",3,8,5)
+        cost=st.slider("Public good cost",20,200,80)
+        cols=st.columns(n_ag)
+        dv=[15,25,10,30,20,18,22,12]
+        pgv=[col.number_input(f"Agent {i}",0,60,dv[i],key=f"pgv{i}")
+             for i,col in enumerate(cols)]
+
+        total=sum(pgv); provide=total>=cost
+        c1,c2,c3=st.columns(3)
+        c1.metric("Total Value",str(total))
+        c2.metric("Cost",str(cost))
+        c3.metric("Decision","Provide ✓" if provide else "Do Not Provide")
+
+        if provide:
+            st.success(f"Efficient: total value {total} ≥ cost {cost}. "
+                       f"Net social gain: {total-cost}")
+        else:
+            st.error(f"Inefficient to provide: {total} < {cost}")
+
+        pivotal=[i for i in range(n_ag)
+                 if (sum(v for j,v in enumerate(pgv) if j!=i)>=cost)!=provide]
+        if pivotal:
+            st.info(f"Pivotal agents (pay Clarke tax): {pivotal}")
+        else:
+            st.info("No agent is pivotal — no Clarke tax collected")
+
+# ── TAB 8: Multi-Agent RL ─────────────────────────────────────────────────────
+with tabs[8]:
+    st.markdown("# Multi-Agent RL — MAKOTO Extension")
+    st.markdown("*Two firms learn Cournot competition via gradient ascent — Nash, collusion, or something else?*")
+    st.divider()
+
+    c1,c2,c3=st.columns(3)
+    a_e=c1.slider("Demand (a)",50,150,100)
+    c_e=c2.slider("Cost (c)",0,40,10)
+    rds_rl=c3.slider("Rounds",200,2000,600)
+    lr_e=st.slider("Learning rate",0.01,0.20,0.08,0.01)
+
+    env_e=CournotEnv(a=a_e,b=1,c=c_e)
+    qn_e=env_e.q_nash
+    qm_e=(a_e-c_e)/2
+
+    if st.button("Run Training",type="primary"):
+        np.random.seed(42)
+        ag1=GradientAgent(q0=qn_e*0.5,lr=lr_e,sig=4.)
+        ag2=GradientAgent(q0=qn_e*1.5,lr=lr_e,sig=4.)
+
+        with st.spinner(f"Training {rds_rl} rounds..."):
+            for t in range(rds_rl):
+                q1=ag1.act();q2=ag2.act()
+                p1,p2=env_e.profit(q1,q2)
+                ag1.update(q1,p1);ag2.update(q2,p2)
+
+        avg_q=(ag1.mu+ag2.mu)/2
+        gap_nash=abs(avg_q-qn_e)/qn_e*100
+        gap_mono=abs(avg_q-qm_e/2)/(qm_e/2)*100
+
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric("Firm 1 final q",f"{ag1.mu:.2f}")
+        c2.metric("Firm 2 final q",f"{ag2.mu:.2f}")
+        c3.metric("Nash target",f"{qn_e:.2f}")
+        outcome=("Collusion detected 🚨" if avg_q<qn_e*0.85
+                 else "Nash convergence ✓" if gap_nash<15
+                 else "Learning in progress")
+        c4.metric("Outcome",outcome,f"{gap_nash:.1f}% from Nash")
+
+        fig_ml=make_subplots(rows=1,cols=2,
+            subplot_titles=["Quantity Convergence","Strategy Space"])
+
+        t_ax=list(range(len(ag1.hist_mu)))
+        fig_ml.add_trace(go.Scatter(x=t_ax,y=ag1.hist_mu,
+            name='Firm 1',line=dict(color='#60a5fa',width=2)),row=1,col=1)
+        fig_ml.add_trace(go.Scatter(x=t_ax,y=ag2.hist_mu,
+            name='Firm 2',line=dict(color='#34d399',width=2)),row=1,col=1)
+        fig_ml.add_hline(y=qn_e,line_dash="dash",line_color="#f59e0b",
+                          line_width=2,annotation_text=f"Nash q*={qn_e:.1f}",
+                          row=1,col=1)
+        fig_ml.add_hline(y=qm_e/2,line_dash="dot",line_color="#f87171",
+                          line_width=1,annotation_text=f"Collude q={qm_e/2:.1f}",
+                          row=1,col=1)
+
+        step=max(1,rds_rl//80)
+        fig_ml.add_trace(go.Scatter(
+            x=ag1.hist_mu[::step],y=ag2.hist_mu[::step],
+            mode='lines+markers',name='Path',showlegend=False,
+            line=dict(color='#a78bfa',width=1.5),
+            marker=dict(size=4,color=list(range(len(ag1.hist_mu[::step]))),
+                        colorscale='Viridis')),row=1,col=2)
+        fig_ml.add_trace(go.Scatter(x=[qn_e],y=[qn_e],mode='markers',
+            name='Nash',marker=dict(color='#f59e0b',size=14,symbol='star')),
+            row=1,col=2)
+        q_br=np.linspace(0,min(a_e,80),100)
+        br=[env_e.best_response(q) for q in q_br]
+        fig_ml.add_trace(go.Scatter(x=q_br,y=br,mode='lines',showlegend=False,
+            line=dict(color='#f87171',width=1,dash='dot'),name='BR₁'),
+            row=1,col=2)
+        fig_ml.add_trace(go.Scatter(x=br,y=q_br,mode='lines',showlegend=False,
+            line=dict(color='#34d399',width=1,dash='dot'),name='BR₂'),
+            row=1,col=2)
+
+        fig_ml.update_layout(template="plotly_dark",height=480,
+            paper_bgcolor="#0e1117",plot_bgcolor="#0e1117",font=dict(color='white'))
+        fig_ml.update_xaxes(gridcolor='#1f2937')
+        fig_ml.update_yaxes(gridcolor='#1f2937')
+        fig_ml.update_xaxes(title_text="Round",row=1,col=1)
+        fig_ml.update_xaxes(title_text="Firm 1 q",row=1,col=2)
+        fig_ml.update_yaxes(title_text="Quantity",row=1,col=1)
+        fig_ml.update_yaxes(title_text="Firm 2 q",row=1,col=2)
+        st.plotly_chart(fig_ml,use_container_width=True)
+
+        st.markdown("<div class='sh'>MAKOTO Connection</div>",
+                    unsafe_allow_html=True)
+        st.markdown(f"""
+MAKOTO (Section VI) identified **single-agent design** as its primary limitation.
+This tab is the direct extension: instead of one planner optimizing global policy,
+two agents with competing interests learn simultaneously.
+
+With learning rate **{lr_e}** and **{rds_rl}** rounds:
+- Average quantity: **{avg_q:.2f}** vs Nash **{qn_e:.2f}**
+- Gap from Nash: **{gap_nash:.1f}%**
+- Outcome: **{outcome}**
+
+If agents learn to collude (produce below Nash), this demonstrates that
+multi-agent RL systems can develop implicit coordination without communication —
+a finding with direct policy implications for antitrust and international economics.
+        """)
+    else:
+        st.info("Set parameters above and click **Run Training** to simulate "
+                "two firms learning the Cournot game.")
+        c1,c2=st.columns(2)
+        c1.metric("Nash equilibrium target",f"{qn_e:.2f} per firm")
+        c2.metric("Monopoly (collusion) target",f"{qm_e/2:.2f} per firm")

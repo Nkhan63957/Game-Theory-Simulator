@@ -1,0 +1,143 @@
+import numpy as np
+import networkx as nx
+import plotly.graph_objects as go
+import pandas as pd
+
+# ── Network Public Goods Game ─────────────────────────────────────────────────
+def network_public_goods(G, endowment=10, return_rate=1.6,
+                          rounds=30, seed=42):
+    """
+    Each node decides contribution to local public good.
+    Payoff depends on neighbors' contributions (not global).
+    """
+    np.random.seed(seed)
+    n   = len(G.nodes)
+    pos = nx.spring_layout(G, seed=42)
+
+    contributions = np.random.uniform(3, 7, n)
+    history       = []
+
+    for round_n in range(rounds):
+        payoffs = np.zeros(n)
+        for i in G.nodes:
+            neighbors = list(G.neighbors(i))
+            if not neighbors:
+                payoffs[i] = endowment - contributions[i]
+                continue
+            local_pool = contributions[i] + sum(
+                contributions[j] for j in neighbors
+            )
+            share = return_rate * local_pool / (len(neighbors) + 1)
+            payoffs[i] = endowment - contributions[i] + share
+
+        history.append({
+            'round': round_n,
+            'avg_contribution': np.mean(contributions),
+            'gini': np.std(contributions) / (np.mean(contributions)+1e-9)
+        })
+
+        # Best response update with noise
+        new_c = contributions.copy()
+        for i in G.nodes:
+            neighbors = list(G.neighbors(i))
+            if neighbors:
+                best_neighbor = neighbors[np.argmax(
+                    [payoffs[j] for j in neighbors]
+                )]
+                if payoffs[best_neighbor] > payoffs[i]:
+                    new_c[i] = (contributions[i] * 0.7 +
+                                contributions[best_neighbor] * 0.3 +
+                                np.random.normal(0, 0.5))
+            new_c[i] = np.clip(new_c[i], 0, endowment)
+        contributions = new_c
+
+    return contributions, payoffs, history, pos
+
+# ── Network topologies ────────────────────────────────────────────────────────
+NETWORKS = {
+    'Complete Graph':   nx.complete_graph(12),
+    'Star Network':     nx.star_graph(11),
+    'Random (ER)':      nx.erdos_renyi_graph(12, 0.4, seed=42),
+    'Scale-Free (BA)':  nx.barabasi_albert_graph(12, 2, seed=42),
+    'Small World (WS)': nx.watts_strogatz_graph(12, 4, 0.3, seed=42),
+}
+
+print("=" * 60)
+print("NETWORK GAMES — PUBLIC GOODS ON GRAPHS")
+print("=" * 60)
+
+results = {}
+for name, G in NETWORKS.items():
+    contribs, payoffs, hist, pos = network_public_goods(G, rounds=40)
+    results[name] = {
+        'final_contribution': np.mean(contribs),
+        'final_payoff': np.mean(payoffs),
+        'gini': np.std(contribs)/(np.mean(contribs)+1e-9),
+        'density': nx.density(G),
+        'avg_clustering': nx.average_clustering(G),
+        'contributions': contribs,
+        'payoffs': payoffs,
+        'history': hist,
+        'pos': pos,
+        'G': G
+    }
+    print(f"\n{name}:")
+    print(f"  Density: {nx.density(G):.3f} | "
+          f"Avg clustering: {nx.average_clustering(G):.3f}")
+    print(f"  Final avg contribution: {np.mean(contribs):.2f}")
+    print(f"  Final avg payoff: {np.mean(payoffs):.2f}")
+    print(f"  Contribution inequality (Gini): "
+          f"{np.std(contribs)/(np.mean(contribs)+1e-9):.3f}")
+
+# ── Summary comparison ────────────────────────────────────────────────────────
+summary_df = pd.DataFrame({
+    'Network': list(results.keys()),
+    'Density': [results[n]['density'] for n in results],
+    'Avg Contribution': [results[n]['final_contribution']
+                         for n in results],
+    'Avg Payoff': [results[n]['final_payoff'] for n in results],
+    'Inequality': [results[n]['gini'] for n in results]
+}).round(3)
+print(f"\nSummary across network topologies:")
+print(summary_df.to_string(index=False))
+
+# ── Visualize network with contribution heatmap ───────────────────────────────
+def plot_network_game(G, contributions, pos, title):
+    edge_x, edge_y = [], []
+    for e in G.edges():
+        x0,y0 = pos[e[0]]; x1,y1 = pos[e[1]]
+        edge_x += [x0,x1,None]; edge_y += [y0,y1,None]
+
+    node_x = [pos[n][0] for n in G.nodes]
+    node_y = [pos[n][1] for n in G.nodes]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=edge_x, y=edge_y, mode='lines',
+        line=dict(color='rgba(148,163,184,0.3)', width=1.5),
+        showlegend=False))
+    fig.add_trace(go.Scatter(
+        x=node_x, y=node_y, mode='markers+text',
+        marker=dict(size=20, color=contributions,
+                    colorscale='RdYlGn', colorbar=dict(title='Contribution'),
+                    cmin=0, cmax=10,
+                    line=dict(color='white', width=1.5)),
+        text=[f"{c:.1f}" for c in contributions],
+        textfont=dict(color='black', size=9),
+        showlegend=False
+    ))
+    fig.update_layout(
+        title=title, template="plotly_dark", height=420,
+        paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+        font=dict(color='white'),
+        xaxis=dict(showgrid=False,zeroline=False,showticklabels=False),
+        yaxis=dict(showgrid=False,zeroline=False,showticklabels=False)
+    )
+    return fig
+
+for name in ['Complete Graph','Star Network','Scale-Free (BA)']:
+    r = results[name]
+    fig = plot_network_game(r['G'], r['contributions'],
+                             r['pos'], f"{name} — Final Contributions")
+    fig.show()
+
+print("\nNetwork games complete ✓")
